@@ -4,23 +4,43 @@ import {
   Typestate,
   InterpreterStatus,
   StateMachine,
+  assign,
 } from '@xstate/fsm';
 import { playerConfig, eventWithTime } from '../types';
+import Timer from './timer';
 
-type PlayerContext = {
+export type PlayerContext = {
   events: eventWithTime[];
-  timeOffset: number;
+  timer: Timer;
   speed: playerConfig['speed'];
+  timeOffset: number;
+  lastPlayedEvent: eventWithTime | null;
 };
-type PlayerEvent =
-  | { type: 'PLAY' }
+export type PlayerEvent =
+  | {
+      type: 'PLAY';
+      payload: {
+        timeOffset: number;
+      };
+    }
+  | {
+      type: 'CAST_EVENT';
+      payload: {
+        event: eventWithTime;
+      };
+    }
   | { type: 'PAUSE' }
-  | { type: 'RESUME' }
+  | {
+      type: 'RESUME';
+      payload: {
+        timeOffset: number;
+      };
+    }
   | { type: 'END' }
   | { type: 'REPLAY' }
   | { type: 'FAST_FORWARD' }
   | { type: 'BACK_TO_NORMAL' };
-type PlayerState =
+export type PlayerState =
   | {
       value: 'inited';
       context: PlayerContext;
@@ -113,39 +133,71 @@ function interpret<
 }
 
 export function createPlayerService(context: PlayerContext) {
-  const playerMachine = createMachine<PlayerContext, PlayerEvent, PlayerState>({
-    id: 'player',
-    context,
-    initial: 'inited',
-    states: {
-      inited: {
-        on: {
-          PLAY: 'playing',
+  const playerMachine = createMachine<PlayerContext, PlayerEvent, PlayerState>(
+    {
+      id: 'player',
+      context,
+      initial: 'inited',
+      states: {
+        inited: {
+          on: {
+            PLAY: {
+              target: 'playing',
+              actions: assign({
+                timeOffset: (ctx, event) => event.payload.timeOffset,
+              }),
+            },
+          },
         },
-      },
-      playing: {
-        on: {
-          PAUSE: 'paused',
-          END: 'ended',
-          FAST_FORWARD: 'skipping',
+        playing: {
+          on: {
+            PAUSE: 'paused',
+            END: 'ended',
+            FAST_FORWARD: 'skipping',
+            CAST_EVENT: {
+              target: 'playing',
+              actions: 'castEvent',
+            },
+          },
         },
-      },
-      paused: {
-        on: {
-          RESUME: 'playing',
+        paused: {
+          on: {
+            RESUME: {
+              target: 'playing',
+              actions: assign({
+                timeOffset: (ctx, event) => event.payload.timeOffset,
+              }),
+            },
+            CAST_EVENT: {
+              target: 'paused',
+              actions: 'castEvent',
+            },
+          },
         },
-      },
-      skipping: {
-        on: {
-          BACK_TO_NORMAL: 'playing',
+        skipping: {
+          on: {
+            BACK_TO_NORMAL: 'playing',
+          },
         },
-      },
-      ended: {
-        on: {
-          REPLAY: 'playing',
+        ended: {
+          on: {
+            REPLAY: 'playing',
+          },
         },
       },
     },
-  });
+    {
+      actions: {
+        castEvent: assign({
+          lastPlayedEvent: (ctx, event) => {
+            if (event.type === 'CAST_EVENT') {
+              return event.payload.event;
+            }
+            return context.lastPlayedEvent;
+          },
+        }),
+      },
+    },
+  );
   return interpret(playerMachine);
 }

@@ -1,8 +1,14 @@
 import { rebuild, buildNodeWithSN } from 'rrweb-snapshot';
 import * as mittProxy from 'mitt';
 import * as smoothscroll from 'smoothscroll-polyfill';
+import { StateMachine } from '@xstate/fsm';
 import Timer from './timer';
-import { createPlayerService } from './machine';
+import {
+  createPlayerService,
+  PlayerContext,
+  PlayerEvent,
+  PlayerState,
+} from './machine';
 import {
   EventType,
   IncrementalSource,
@@ -53,9 +59,10 @@ export class Replayer {
   public wrapper: HTMLDivElement;
   public iframe: HTMLIFrameElement;
 
-  public timer: Timer;
+  public get timer() {
+    return this.service.state.context.timer;
+  }
 
-  private events: eventWithTime[] = [];
   private config: playerConfig;
 
   private mouse: HTMLDivElement;
@@ -63,8 +70,6 @@ export class Replayer {
   private emitter: Emitter = mitt();
 
   private baselineTime: number = 0;
-  // record last played event timestamp when paused
-  private lastPlayedEvent: eventWithTime;
 
   private nextUserInteractionEvent: eventWithTime | null;
   private noramlSpeed: number = -1;
@@ -80,6 +85,9 @@ export class Replayer {
     if (events.length < 2) {
       throw new Error('Replayer need at least 2 events.');
     }
+
+    this.config = Object.assign({}, defaultConfig, config);
+
     this.service = createPlayerService({
       events: events.map((e) => {
         if (config && config.unpackFn) {
@@ -87,25 +95,25 @@ export class Replayer {
         }
         return e as eventWithTime;
       }),
-      timeOffset: 0,
+      timer: new Timer(this.config),
       speed: config?.speed || defaultConfig.speed,
+      timeOffset: 0,
+      lastPlayedEvent: null,
     });
     this.service.start();
-    this.events = events.map((e) => {
-      if (config && config.unpackFn) {
-        return config.unpackFn(e as string);
+    this.service.subscribe((state) => {
+      if (!state.changed) {
+        return;
       }
-      return e as eventWithTime;
+      this.handleStateChange(state);
     });
+
     this.handleResize = this.handleResize.bind(this);
+    this.emitter.on('resize', this.handleResize as Handler);
 
-    this.config = Object.assign({}, defaultConfig, config);
-
-    this.timer = new Timer(this.config);
     smoothscroll.polyfill();
     polyfill();
     this.setupDom();
-    this.emitter.on('resize', this.handleResize as Handler);
   }
 
   public on(event: string, handler: Handler) {
@@ -123,8 +131,9 @@ export class Replayer {
   }
 
   public getMetaData(): playerMetaData {
-    const firstEvent = this.events[0];
-    const lastEvent = this.events[this.events.length - 1];
+    const { events } = this.service.state.context;
+    const firstEvent = events[0];
+    const lastEvent = events[events.length - 1];
     return {
       totalTime: lastEvent.timestamp - firstEvent.timestamp,
     };
@@ -135,7 +144,7 @@ export class Replayer {
   }
 
   public getTimeOffset(): number {
-    return this.baselineTime - this.events[0].timestamp;
+    return this.baselineTime - this.service.state.context.events[0].timestamp;
   }
 
   /**
@@ -148,56 +157,17 @@ export class Replayer {
    * @param timeOffset number
    */
   public play(timeOffset = 0) {
-    this.timer.clear();
-    this.baselineTime = this.events[0].timestamp + timeOffset;
-    const actions = new Array<actionWithDelay>();
-    for (const event of this.events) {
-      const isSync = event.timestamp < this.baselineTime;
-      const castFn = this.getCastFn(event, isSync);
-      if (isSync) {
-        castFn();
-      } else {
-        actions.push({
-          doAction: () => {
-            castFn();
-            this.emitter.emit(ReplayerEvents.EventCast, event);
-          },
-          delay: this.getDelay(event),
-        });
-      }
-    }
-    this.timer.addActions(actions);
-    this.timer.start();
-    this.service.send({ type: 'PLAY' });
+    this.service.send({ type: 'PLAY', payload: { timeOffset } });
     this.emitter.emit(ReplayerEvents.Start);
   }
 
   public pause() {
-    this.timer.clear();
     this.service.send({ type: 'PAUSE' });
     this.emitter.emit(ReplayerEvents.Pause);
   }
 
   public resume(timeOffset = 0) {
-    this.timer.clear();
-    this.baselineTime = this.events[0].timestamp + timeOffset;
-    const actions = new Array<actionWithDelay>();
-    for (const event of this.events) {
-      if (
-        event.timestamp <= this.lastPlayedEvent.timestamp ||
-        event === this.lastPlayedEvent
-      ) {
-        continue;
-      }
-      const castFn = this.getCastFn(event);
-      actions.push({
-        doAction: castFn,
-        delay: this.getDelay(event),
-      });
-    }
-    this.timer.addActions(actions);
-    this.timer.start();
-    this.service.send({ type: 'RESUME' });
+    this.service.send({ type: 'RESUME', payload: { timeOffset } });
     this.emitter.emit(ReplayerEvents.Resume);
   }
 
@@ -207,6 +177,51 @@ export class Replayer {
       : (rawEvent as eventWithTime);
     const castFn = this.getCastFn(event, true);
     castFn();
+  }
+
+  private handleStateChange(
+    state: StateMachine.State<PlayerContext, PlayerEvent, PlayerState>,
+  ) {
+    const { events } = state.context;
+    switch (true) {
+      case state.matches('playing'): {
+        this.timer.clear();
+        this.baselineTime = events[0].timestamp + state.context.timeOffset;
+        const actions = new Array<actionWithDelay>();
+        for (const event of events) {
+          if (
+            state.context.lastPlayedEvent &&
+            (event.timestamp <= state.context.lastPlayedEvent.timestamp ||
+              event === state.context.lastPlayedEvent)
+          ) {
+            continue;
+          }
+          const isSync = event.timestamp < this.baselineTime;
+          const castFn = this.getCastFn(event, isSync);
+          if (isSync) {
+            castFn();
+          } else {
+            actions.push({
+              doAction: () => {
+                castFn();
+                this.emitter.emit(ReplayerEvents.EventCast, event);
+              },
+              delay: this.getDelay(event),
+            });
+          }
+        }
+        this.timer.addActions(actions);
+        this.timer.start();
+        this.emitter.emit(ReplayerEvents.Start);
+        break;
+      }
+      case state.matches('paused'): {
+        this.timer.clear();
+        break;
+      }
+      default:
+        break;
+    }
   }
 
   private setupDom() {
@@ -249,6 +264,7 @@ export class Replayer {
   }
 
   private getCastFn(event: eventWithTime, isSync = false) {
+    const { events } = this.service.state.context;
     let castFn: undefined | (() => void);
     switch (event.type) {
       case EventType.DomContentLoaded:
@@ -275,7 +291,7 @@ export class Replayer {
             this.restoreSpeed();
           }
           if (this.config.skipInactive && !this.nextUserInteractionEvent) {
-            for (const _event of this.events) {
+            for (const _event of events) {
               if (_event.timestamp! <= event.timestamp!) {
                 continue;
               }
@@ -308,8 +324,8 @@ export class Replayer {
       if (castFn) {
         castFn();
       }
-      this.lastPlayedEvent = event;
-      if (event === this.events[this.events.length - 1]) {
+      this.service.send({ type: 'CAST_EVENT', payload: { event } });
+      if (event === events[events.length - 1]) {
         this.restoreSpeed();
         this.emitter.emit(ReplayerEvents.Finish);
       }
@@ -349,26 +365,17 @@ export class Replayer {
     if (head) {
       const unloadSheets: Set<HTMLLinkElement> = new Set();
       let timer: number;
+      let beforeLoadState = this.service.state;
       head
         .querySelectorAll('link[rel="stylesheet"]')
         .forEach((css: HTMLLinkElement) => {
           if (!css.sheet) {
-            if (unloadSheets.size === 0) {
-              this.timer.clear(); // artificial pause
-              this.emitter.emit(ReplayerEvents.LoadStylesheetStart);
-              timer = window.setTimeout(() => {
-                if (this.service.state.matches('playing')) {
-                  this.resume(this.getCurrentTime());
-                }
-                // mark timer was called
-                timer = -1;
-              }, this.config.loadTimeout);
-            }
             unloadSheets.add(css);
             css.addEventListener('load', () => {
               unloadSheets.delete(css);
+              // all loaded and timer not released yet
               if (unloadSheets.size === 0 && timer !== -1) {
-                if (this.service.state.matches('playing')) {
+                if (beforeLoadState.matches('playing')) {
                   this.resume(this.getCurrentTime());
                 }
                 this.emitter.emit(ReplayerEvents.LoadStylesheetEnd);
@@ -379,6 +386,19 @@ export class Replayer {
             });
           }
         });
+
+      if (unloadSheets.size > 0) {
+        // find some unload sheets after iterate
+        this.service.send({ type: 'PAUSE' });
+        this.emitter.emit(ReplayerEvents.LoadStylesheetStart);
+        timer = window.setTimeout(() => {
+          if (beforeLoadState.matches('playing')) {
+            this.resume(this.getCurrentTime());
+          }
+          // mark timer was called
+          timer = -1;
+        }, this.config.loadTimeout);
+      }
     }
   }
 
